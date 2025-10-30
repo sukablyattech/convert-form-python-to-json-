@@ -1,2 +1,1 @@
-# convert-form-python-to-json-
-python to json convrted use when neded
+this read me concLudes python to json file use whrn neeeed
