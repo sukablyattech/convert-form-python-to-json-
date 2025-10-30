@@ -1,0 +1,377 @@
+// ==UserScript==
+// @name         Convert Page Scripts to Python (Heuristic)
+// @namespace    http://tampermonkey.net/
+// @version      0.1
+// @description  Heuristically convert inline & external <script> content and code blocks to a Python-like representation. Limited, best-effort translator for inspection/review. You will need to review and fix translations manually.
+// @author       sukablyattech
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @connect      *
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Simple heuristic JS -> Python translator. Not a real transpiler.
+    function jsToPython(js) {
+        // Normalize line endings
+        let code = js.replace(/\r\n/g, '\n');
+
+        // Remove HTML comments that sometimes appear in inline scripts
+        code = code.replace(/<!--|-->/g, '');
+
+        // Common token replacements (order matters)
+        const replacements = [
+            // console -> print
+            { r: /\bconsole\.log\s*\(/g, s: 'print(' },
+            { r: /\bconsole\.error\s*\(/g, s: 'print(' },
+            { r: /\bconsole\.warn\s*\(/g, s: 'print(' },
+
+            // var/let/const -> nothing (Python is dynamic)
+            { r: /\bvar\s+/g, s: '' },
+            { r: /\blet\s+/g, s: '' },
+            { r: /\bconst\s+/g, s: '' },
+
+            // ===, !== -> ==, != (loose mapping)
+            { r: /===/g, s: '==' },
+            { r: /!==/g, s: '!=' },
+
+            // Arrow functions: (args) => { body }  -> def name(args):\n    body
+            // We'll convert simple anonymous arrow functions to "def anon(...):"
+            { r: /([(\w\s,]*)=>\s*{([^}]*)}/g, s: function (_, args, body) {
+                const a = args.trim() || '';
+                const argList = a.replace(/^\(|\)$/g, '');
+                return `def anon(${argList}):\n${indent(body.trim())}\n`;
+            }},
+
+            // Simple function declarations: function name(a,b) { ... } -> def name(a,b):\n    ...
+            { r: /function\s+([A-Za-z0-9_$]+)\s*\(([^\)]*)\)\s*{([^}]*)}/g, s: function (_, name, args, body) {
+                return `def ${name}(${args.trim()}):\n${indent(body.trim())}\n`;
+            }},
+
+            // Function expressions: var x = function(a){...} -> def x(a): ...
+            { r: /([A-Za-z0-9_$]+)\s*=\s*function\s*\(([^\)]*)\)\s*{([^}]*)}/g, s: function (_, name, args, body) {
+                return `def ${name}(${args.trim()}):\n${indent(body.trim())}\n`;
+            }},
+
+            // for loops: for (let i = 0; i < n; i++) -> for i in range(n):
+            { r: /for\s*\(\s*(?:let|var|const)?\s*([A-Za-z0-9_$]+)\s*=\s*0\s*;\s*\1\s*<\s*([A-Za-z0-9_$\.\(\)]+)\s*;\s*\1\+\+\s*\)\s*{/g, s: function (_, i, n) {
+                return `for ${i} in range(${n}):\n`;
+            }},
+
+            // for..of -> for x in iterable:
+            { r: /for\s*\(\s*([A-Za-z0-9_$]+)\s+of\s+([A-Za-z0-9_$.()]+)\s*\)\s*{/g, s: 'for $1 in $2:\n' },
+
+            // if (...) { -> if ...:
+            { r: /if\s*\(\s*([^\)]+)\s*\)\s*{/g, s: function (_, cond) { return `if ${cond.trim()}:\n`; }},
+
+            // else { -> else:
+            { r: /}\s*else\s*{/g, s: '\nelse:\n' },
+
+            // } -> (we'll convert braces to newlines/indent via simple approach)
+            // Replace ';' with newline
+            { r: /;/g, s: '\n' },
+
+            // .length -> len(...)
+            { r: /([A-Za-z0-9_$\)\]\"]+)\.length\b/g, s: function (_, obj) { return `len(${obj})`; }},
+
+            // JSON object literal -> Python dict (very naive: replace true/false/null)
+            { r: /\btrue\b/g, s: 'True' },
+            { r: /\bfalse\b/g, s: 'False' },
+            { r: /\bnull\b/g, s: 'None' },
+
+            // property access a['b'] remains; keep as-is
+        ];
+
+        // Apply replacements (functions allowed)
+        for (const rep of replacements) {
+            if (typeof rep.s === 'function') {
+                code = code.replace(rep.r, rep.s);
+            } else {
+                code = code.replace(rep.r, rep.s);
+            }
+        }
+
+        // Convert braces into indentation: naive block-to-indent transform.
+        // We'll transform { and } into indentation markers and then process lines.
+        code = code.replace(/{/g, '\n__INDENT__\n').replace(/}/g, '\n__DEDENT__\n');
+
+        // Split into lines and handle indent stack
+        const lines = code.split('\n');
+        let indentLevel = 0;
+        const out = [];
+        for (let rawLine of lines) {
+            let line = rawLine.trim();
+            if (line === '' || line === '__INDENT__' || line === '__DEDENT__') {
+                if (line === '__INDENT__') {
+                    indentLevel++;
+                } else if (line === '__DEDENT__') {
+                    indentLevel = Math.max(0, indentLevel - 1);
+                } else {
+                    // blank line -> preserve
+                    out.push('');
+                }
+                continue;
+            }
+            // Prepend indentation (4 spaces per level)
+            out.push('    '.repeat(indentLevel) + line);
+        }
+
+        // Post-process: replace common JS idioms to Python-like (very limited)
+        let py = out.join('\n');
+
+        // Replace '=>' leftover occurrences (if any) with comment
+        py = py.replace(/=>/g, '# =>');
+
+        // Basic semi-structure cleanup: remove multiple blank lines
+        py = py.replace(/\n{3,}/g, '\n\n');
+
+        // Add a header note
+        py = '# Translated (heuristic) from JavaScript — review and fix manually\n' + py;
+
+        return py;
+    }
+
+    function indent(text, spaces = 4) {
+        return text.split('\n').map(l => ' '.repeat(spaces) + l).join('\n') + '\n';
+    }
+
+    // Helper: fetch external script content (CORS may block; we use GM_xmlhttpRequest which can help)
+    function fetchScriptContent(url) {
+        return new Promise((resolve, reject) => {
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    responseType: 'text',
+                    onload: function (res) {
+                        if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+                        else reject(new Error('HTTP ' + res.status));
+                    },
+                    onerror: function (err) { reject(err); },
+                });
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    // Build UI: a small floating button
+    function makeButton() {
+        const btn = document.createElement('button');
+        btn.id = 'convert-to-python-btn';
+        btn.textContent = 'Convert scripts → Python';
+        Object.assign(btn.style, {
+            position: 'fixed',
+            right: '12px',
+            bottom: '12px',
+            zIndex: 999999,
+            background: '#0b74de',
+            color: 'white',
+            border: 'none',
+            padding: '8px 12px',
+            borderRadius: '6px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+            cursor: 'pointer',
+            fontSize: '13px',
+        });
+        btn.addEventListener('click', onConvertClick);
+        document.body.appendChild(btn);
+    }
+
+    async function onConvertClick() {
+        try {
+            const scripts = Array.from(document.querySelectorAll('script'));
+            const codeBlocks = Array.from(document.querySelectorAll('pre, code'));
+
+            const items = [];
+
+            // Inline and external scripts
+            for (const s of scripts) {
+                const src = s.getAttribute('src');
+                if (src) {
+                    // Try fetch external script
+                    let text = '';
+                    try {
+                        const absolute = new URL(src, location.href).href;
+                        text = await fetchScriptContent(absolute);
+                    } catch (err) {
+                        text = `/* Could not fetch external script: ${err.message || err} */\n`;
+                    }
+                    items.push({ type: 'external-script', src: src, content: text });
+                } else {
+                    items.push({ type: 'inline-script', src: null, content: s.textContent || '' });
+                }
+            }
+
+            // Code blocks: include only if they look like code (simple heuristic)
+            for (const cb of codeBlocks) {
+                const txt = cb.textContent || '';
+                if (txt.trim().length === 0) continue;
+                // Heuristic: if it contains "function" or "console" or "=>", treat as JS
+                if (/(function\b|console\.|=>|var\s+|let\s+|const\s+|document\.|window\.)/.test(txt)) {
+                    items.push({ type: 'code-block', src: null, content: txt });
+                    }a      
+            if (items.length === 0) {
+                alert('No scripts or JS-like code blocks found on this page.');
+                return;
+            }
+
+            // Convert all items
+            const converted = items.map(it => ({
+                ...it,
+                python: jsToPython(it.content || '')
+            }));
+
+            // Show results in a modal
+            showModal(converted);
+        } catch (err) {
+            alert('Error during conversion: ' + (err.message || err));
+            console.error(err);
+        }
+    }
+
+    // Modal lagg   
+    function showModal(items) {
+        // Remove existing modal if present
+        const existing = document.getElementById('convert-to-python-modal');
+        if (existing) existing.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'convert-to-python-modal';
+        Object.assign(modal.style, {
+            position: 'fixed',
+            left: '8%',
+            top: '6%',
+            width: '84%',
+            height: '88%',
+            background: 'white',
+            color: '#111',
+            zIndex: 1000000,
+            border: '1px solid #ccc',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+            overflow: 'auto',
+            borderRadius: '6px',
+            padding: '12px',
+            fontFamily: 'monospace',
+            fontSize: '12px',
+        });
+
+        const header = document.createElement('div');
+        Object.assign(header.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' });
+        const title = document.createElement('strong');
+        title.textContent = 'Converted Python (heuristic) — review before use';
+        header.appendChild(title);
+
+        const controls = document.createElement('div');
+
+        const downloadAllBtn = document.createElement('button');
+        downloadAllBtn.textContent = 'Download all .py';
+        Object.assign(downloadAllBtn.style, { marginRight: '8px' });
+        downloadAllBtn.addEventListener('click', () => {
+            items.forEach((it, idx) => {
+                const name = sanitiseFilename((it.src ? new URL(it.src, location.href).pathname.split('/').pop() : `script${idx+1}.js`) || `script${idx+1}.js`).replace(/\.[^.]+$/, '') + '.py';
+                const blob = new Blob([it.python], { type: 'text/plain;charset=utf-8' });
+                // Use GM_download where available
+                try {
+                    const url = URL.createObjectURL(blob);
+                    GM_download({ url, name, saveAs: false });
+                } catch (e) {
+                    // Fallback: create link
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = name;
+                    a.style.display = 'none';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                }
+            });
+        });
+        controls.appendChild(downloadAllBtn);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = 'Close';
+        closeBtn.addEventListener('click', () => modal.remove());
+        controls.appendChild(closeBtn);
+
+        header.appendChild(controls);
+        modal.appendChild(header);
+
+        // Content: for each converted item show header, source info, python code, copy/download buttons
+        items.forEach((it, idx) => {
+            const section = document.createElement('div');
+            Object.assign(section.style, { marginBottom: '12px', borderTop: '1px dashed #ddd', paddingTop: '8px' });
+
+            const h = document.createElement('div');
+            h.textContent = `${idx + 1}. ${it.type}${it.src ? ' — ' + it.src : ''}`;
+            Object.assign(h.style, { marginBottom: '6px', fontWeight: '600' });
+            section.appendChild(h);
+
+            const toolbar = document.createElement('div');
+            toolbar.style.marginBottom = '6px';
+
+            const copyBtn = document.createElement('button');
+            copyBtn.textContent = 'Copy';
+            copyBtn.addEventListener('click', () => {
+                navigator.clipboard.writeText(it.python).then(() => alert('Copied to clipboard'), e => alert('Copy failed: ' + e));
+            });
+            toolbar.appendChild(copyBtn);
+
+            const dlBtn = document.createElement('button');
+            dlBtn.textContent = 'Download .py';
+            dlBtn.style.marginLeft = '8px';
+            dlBtn.addEventListener('click', () => {
+                const name = sanitiseFilename((it.src ? new URL(it.src, location.href).pathname.split('/').pop() : `script${idx+1}.js`) || `script${idx+1}.js`).replace(/\.[^.]+$/, '') + '.py';
+                const blob = new Blob([it.python], { type: 'text/plain;charset=utf-8' });
+                try {
+                    const url = URL.createObjectURL(blob);
+                    GM_download({ url, name, saveAs: false });
+                } catch (e) {
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = name;
+                    a.style.display = 'none';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                }
+            });
+            toolbar.appendChild(dlBtn);
+
+            section.appendChild(toolbar);
+
+            const pre = document.createElement('pre');
+            pre.style.whiteSpace = 'pre-wrap';
+            pre.style.background = '#f6f8fa';
+            pre.style.padding = '8px';
+            pre.style.borderRadius = '4px';
+            pre.style.maxHeight = '360px';
+            pre.style.overflow = 'auto';
+            pre.textContent = it.python;
+            section.appendChild(pre);
+
+            modal.appendChild(section);
+        });
+
+        document.body.appendChild(modal);
+    }
+
+    function sanitiseFilename(name) {
+        return name.replace(/[^A-Za-z0-9._-]/g, '_');
+    }
+
+    // Initialize button after page load
+    function init() {
+        // Avoid adding multiple buttons
+        if (document.getElementById('convert-to-python-btn')) return;
+        makeButton();
+    }
+
+    // Wait for DOM ready
+    if (document.readyState === 'complete' || document.readyState === 'interactive') init();
+    else document.addEventListener('DOMContentLoaded', init);
+
+})();d
